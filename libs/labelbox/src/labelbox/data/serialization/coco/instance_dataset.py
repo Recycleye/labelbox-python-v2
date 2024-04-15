@@ -1,6 +1,8 @@
 # https://cocodataset.org/#format-data
 
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from collections import defaultdict
+from distutils import strtobool
 from typing import Any, Dict, List, Tuple, Optional
 from pathlib import Path
 
@@ -13,8 +15,12 @@ from ...annotation_types.collection import LabelCollection
 from .categories import Categories, hash_category_name
 from .annotation import COCOObjectAnnotation, RLE, get_annotation_lookup, rle_decoding
 from .image import CocoImage, get_image, get_image_id
+from tenacity import retry, stop_after_attempt, wait_fixed
 
-
+@retry(
+    stop=stop_after_attempt(20),
+    wait=wait_fixed(2)
+)
 def mask_to_coco_object_annotation(
         annotation: ObjectAnnotation, annot_idx: int, image_id: int,
         category_id: int) -> Optional[COCOObjectAnnotation]:
@@ -27,6 +33,14 @@ def mask_to_coco_object_annotation(
     xmin, ymin, xmax, ymax = shapely.bounds
     # Iterate over polygon once or multiple polygon for each item
     area = shapely.area
+    # Serialisers for named custom attributes
+    value_serialisers = defaultdict(
+        lambda: lambda s: s,
+        is_pickable=lambda s: bool(strtobool(s)),
+    )
+    classifications = {
+        c.name: value_serialisers[c.name](c.value.answer.name) for c in annotation.classifications
+    }
 
     return COCOObjectAnnotation(
         id=annot_idx,
@@ -38,7 +52,8 @@ def mask_to_coco_object_annotation(
         ],
         area=area,
         bbox=[xmin, ymin, xmax - xmin, ymax - ymin],
-        iscrowd=0)
+        iscrowd=0,
+        attributes=classifications)
 
 
 def vector_to_coco_object_annotation(annotation: ObjectAnnotation,
@@ -56,6 +71,14 @@ def vector_to_coco_object_annotation(annotation: ObjectAnnotation,
             box.start.x, box.start.y, box.end.x, box.start.y, box.end.x,
             box.end.y, box.start.x, box.end.y
         ])
+    # Serialisers for named custom attributes
+    value_serialisers = defaultdict(
+        lambda: lambda s: s,
+        is_pickable=lambda s: bool(strtobool(s)),
+    )
+    classifications = {
+        c.name: value_serialisers[c.name](c.value.answer.name) for c in annotation.classifications
+    }
 
     return COCOObjectAnnotation(id=annot_idx,
                                 image_id=image_id,
@@ -63,7 +86,8 @@ def vector_to_coco_object_annotation(annotation: ObjectAnnotation,
                                 segmentation=[segmentation],
                                 area=shapely.area,
                                 bbox=[xmin, ymin, xmax - xmin, ymax - ymin],
-                                iscrowd=0)
+                                iscrowd=0,
+                                attributes=classifications)
 
 
 def rle_to_common(class_annotations: COCOObjectAnnotation,
@@ -73,6 +97,21 @@ def rle_to_common(class_annotations: COCOObjectAnnotation,
     return ObjectAnnotation(name=class_name,
                             value=Mask(mask=MaskData.from_2D_arr(mask),
                                        color=[1, 1, 1]))
+
+def bbox_to_common(class_annotations: COCOObjectAnnotation,
+                            class_name: str) -> List[ObjectAnnotation]:
+    # Technically it is rectangles. But the key in coco is called bboxes..
+    annotations = []
+    annotations.append(
+        ObjectAnnotation(
+            name=class_name,
+            value=Rectangle(
+                start=Point(x=class_annotations.bbox[0], y=class_annotations.bbox[1]),
+                end=Point(x=class_annotations.bbox[0]+class_annotations.bbox[2], y=class_annotations.bbox[1]+class_annotations.bbox[3])
+            )
+        )
+    )
+    return annotations
 
 
 def segmentations_to_common(class_annotations: COCOObjectAnnotation,
@@ -91,7 +130,7 @@ def segmentations_to_common(class_annotations: COCOObjectAnnotation,
 
 def object_annotation_to_coco(
         annotation: ObjectAnnotation, annot_idx: int, image_id: int,
-        category_id: int) -> Optional[COCOObjectAnnotation]:
+        category_id: int,) -> Optional[COCOObjectAnnotation]:
     if isinstance(annotation.value, Mask):
         return mask_to_coco_object_annotation(annotation, annot_idx, image_id,
                                               category_id)
@@ -106,25 +145,32 @@ def process_label(
     label: Label,
     idx: int,
     image_root: str,
+    cloud_provider=None,
+    azure_storage_container=None,
     max_annotations_per_image=10000
 ) -> Tuple[np.ndarray, List[COCOObjectAnnotation], Dict[str, str]]:
     annot_idx = idx * max_annotations_per_image
     image_id = get_image_id(label, idx)
-    image = get_image(label, image_root, image_id)
+    image = get_image(label, image_root, str(image_id), cloud_provider, azure_storage_container)
     coco_annotations = []
     annotation_lookup = get_annotation_lookup(label.annotations)
     categories = {}
-    for class_name in annotation_lookup:
-        for annotation in annotation_lookup[class_name]:
-            category_id = categories.get(annotation.name) or hash_category_name(
-                annotation.name)
-            coco_annotation = object_annotation_to_coco(annotation, annot_idx,
-                                                        image_id, category_id)
-            if coco_annotation is not None:
-                coco_annotations.append(coco_annotation)
-                if annotation.name not in categories:
-                    categories[annotation.name] = category_id
-                annot_idx += 1
+    for class_name, annotations in annotation_lookup.items():
+        for annot_idx, annotation in enumerate(annotations):
+            # Hash category name and store
+            hash_cat = hash_category_name(annotation.name)
+            categories[hash_cat] = annotation.name
+
+            # Select the conversion function for the annotation type
+            if isinstance(annotation.value, Mask):
+                conv_func = mask_to_coco_object_annotation
+            elif isinstance(annotation.value, (Polygon, Rectangle)):
+                conv_func = vector_to_coco_object_annotation
+            else:
+                continue
+
+            # Convert the annotation and append to the list
+            coco_annotations.append(conv_func(annotation, annot_idx, image_id, hash_cat))
 
     return image, coco_annotations, categories
 
@@ -139,7 +185,9 @@ class CocoInstanceDataset(pydantic_compat.BaseModel):
     def from_common(cls,
                     labels: LabelCollection,
                     image_root: Path,
-                    max_workers=8):
+                    max_workers=8,
+                    cloud_provider=None,
+                    azure_storage_container=None):
         all_coco_annotations = []
         categories = {}
         images = []
@@ -149,7 +197,7 @@ class CocoInstanceDataset(pydantic_compat.BaseModel):
         if max_workers:
             with ProcessPoolExecutor(max_workers=max_workers) as exc:
                 futures = [
-                    exc.submit(process_label, label, idx, image_root)
+                    exc.submit(process_label, label, idx, image_root, cloud_provider, azure_storage_container)
                     for idx, label in enumerate(labels)
                 ]
                 results = [
@@ -158,7 +206,7 @@ class CocoInstanceDataset(pydantic_compat.BaseModel):
         else:
 
             results = [
-                process_label(label, idx, image_root)
+                process_label(label, idx, image_root, cloud_provider, azure_storage_container)
                 for idx, label in enumerate(labels)
             ]
 
@@ -169,13 +217,13 @@ class CocoInstanceDataset(pydantic_compat.BaseModel):
 
         category_mapping = {
             category_id: idx + 1
-            for idx, category_id in enumerate(coco_categories.values())
+            for idx, category_id in enumerate(set(coco_categories.values()))
         }
         categories = [
-            Categories(id=category_mapping[idx],
+            Categories(id=idx,
                        name=name,
                        supercategory='all',
-                       isthing=1) for name, idx in coco_categories.items()
+                       isthing=1) for name, idx in category_mapping.items()
         ]
         for annot in all_coco_annotations:
             annot.category_id = category_mapping[annot.category_id]
@@ -207,8 +255,13 @@ class CocoInstanceDataset(pydantic_compat.BaseModel):
                             class_annotations, category_lookup[
                                 class_annotations.category_id].name))
                 elif isinstance(class_annotations.segmentation, list):
-                    annotations.extend(
-                        segmentations_to_common(
+                    if len(class_annotations.segmentation) == 0 and len(class_annotations.bbox) == 4:
+                        annotations.extend(bbox_to_common(
                             class_annotations, category_lookup[
                                 class_annotations.category_id].name))
+                    else:
+                        annotations.extend(
+                            segmentations_to_common(
+                                class_annotations, category_lookup[
+                                    class_annotations.category_id].name))
             yield Label(data=data, annotations=annotations)
